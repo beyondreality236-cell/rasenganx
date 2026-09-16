@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rasengan</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+
+    .layer {
+      position: fixed; inset: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+    #cam      { z-index: 0; }
+    #skeleton { z-index: 2; pointer-events: none; }
+
+    .vignette {
+      position: fixed; inset: 0;
+      background: radial-gradient(ellipse at center, transparent 35%, rgba(0,0,0,0.55) 100%);
+      pointer-events: none; z-index: 4;
+    }
+
+    .rasengan {
+      position: fixed; top: 0; left: 0;
+      width: 1500px; height: auto;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      mix-blend-mode: screen;
+      opacity: 0;
+      will-change: opacity, left, top;
+      z-index: 10;
+    }
+
+    #hint {
+      position: fixed; bottom: 16px; left: 50%;
+      transform: translateX(-50%);
+      color: #cfe9ff; font-size: 14px; letter-spacing: 0.04em;
+      background: rgba(0,0,0,0.45);
+      padding: 6px 12px; border-radius: 999px;
+      z-index: 6; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <video  id="cam"      class="layer" autoplay playsinline muted></video>
+  <canvas id="skeleton" class="layer"></canvas>
+  <div    class="vignette"></div>
+
+  <video class="rasengan" data-slot="0" src="assets/rasengan.mp4" muted autoplay loop playsinline preload="auto"></video>
+  <video class="rasengan" data-slot="1" src="assets/rasengan.mp4" muted autoplay loop playsinline preload="auto"></video>
+
+  <script>
+    const camVideo = document.getElementById('cam');
+    const canvas   = document.getElementById('skeleton');
+    const pen      = canvas.getContext('2d');
+    const orbs     = Array.from(document.querySelectorAll('.rasengan'));
+
+    // Two distinct palettes so each hand's skeleton is obviously different,
+    // and bones vs joints inside one hand are also different colors.
+    const PALETTES = {
+      Left:  { bone: '#ff8a3d', joint: '#fff36a', glow: '#ff5e1a' }, // warm — Naruto orange
+      Right: { bone: '#62f0ff', joint: '#ff66e0', glow: '#1aa6ff' }  // cool — chakra blue
+    };
+
+    // Per-hand fade-in / fade-out state for the orbs.
+    const orbState = [
+      { charge: 0, wasOpen: false },
+      { charge: 0, wasOpen: false }
+    ];
+
+    const FINGER_TIPS     = [8, 12, 16, 20];
+    const FINGER_KNUCKLES = [6, 10, 14, 18];
+
+    function isPalmOpen(lm) {
+      const wrist = lm[0];
+      let extended = 0;
+      for (let i = 0; i < FINGER_TIPS.length; i++) {
+        const tip = lm[FINGER_TIPS[i]];
+        const knk = lm[FINGER_KNUCKLES[i]];
+        const dTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+        const dKnk = Math.hypot(knk.x - wrist.x, knk.y - wrist.y);
+        if (dTip > dKnk) extended++;
+      }
+      return extended >= 3;
+    }
+
+    // Draw bones in one color, joints in another, with a colored glow,
+    // so the tracking sticks visibly follow each finger.
+    function paintSkeleton(lm, colors) {
+      pen.save();
+      pen.shadowBlur  = 18;
+      pen.shadowColor = colors.glow;
+      drawConnectors(pen, lm, HAND_CONNECTIONS, { color: colors.bone, lineWidth: 3 });
+      pen.restore();
+
+      pen.save();
+      pen.shadowBlur  = 10;
+      pen.shadowColor = colors.glow;
+      pen.fillStyle   = colors.joint;
+      for (const p of lm) {
+        pen.beginPath();
+        pen.arc(p.x * canvas.width, p.y * canvas.height, 3.5, 0, Math.PI * 2);
+        pen.fill();
+      }
+      pen.restore();
+    }
+
+    function placeOrb(slot, lm, charge) {
+      const wrist  = lm[0];
+      const midKnk = lm[9];
+
+      const cx = (wrist.x + midKnk.x) / 2;
+      const cy = (wrist.y + midKnk.y) / 2;
+      const handSize = Math.hypot(midKnk.x - wrist.x, midKnk.y - wrist.y);
+      const lift = handSize * 1.8;
+
+      const orb = orbs[slot];
+      orb.style.left    = `${(1 - cx) * window.innerWidth}px`;
+      orb.style.top     = `${(cy - lift) * window.innerHeight}px`;
+      orb.style.opacity = charge.toFixed(3);
+    }
+
+    function onResults(res) {
+      canvas.width  = camVideo.videoWidth  || canvas.clientWidth;
+      canvas.height = camVideo.videoHeight || canvas.clientHeight;
+      pen.clearRect(0, 0, canvas.width, canvas.height);
+
+      const seen = [false, false];
+
+      if (res.multiHandLandmarks && res.multiHandedness) {
+        res.multiHandLandmarks.forEach((lm, i) => {
+          const label  = res.multiHandedness[i].label; // "Left" | "Right"
+          const slot   = label === 'Right' ? 1 : 0;
+          const colors = PALETTES[label] || PALETTES.Left;
+          seen[slot]   = true;
+
+          paintSkeleton(lm, colors);
+
+          const open = isPalmOpen(lm);
+          const st   = orbState[slot];
+          st.charge  = Math.max(0, Math.min(1, st.charge + (open ? 0.06 : -0.18)));
+
+          if (open && !st.wasOpen) {
+            const v = orbs[slot];
+            v.currentTime = 0;
+            v.play().catch(err => console.warn('rasengan play failed', err));
+          }
+          st.wasOpen = open;
+
+          if (st.charge > 0.01) placeOrb(slot, lm, st.charge);
+          else orbs[slot].style.opacity = 0;
+        });
+      }
+
+      // Decay any hand we didn't see this frame.
+      for (let i = 0; i < 2; i++) {
+        if (seen[i]) continue;
+        orbState[i].charge  = Math.max(0, orbState[i].charge - 0.18);
+        orbState[i].wasOpen = false;
+        orbs[i].style.opacity = orbState[i].charge.toFixed(3);
+      }
+    }
+
+    const hands = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.65,
+      minTrackingConfidence:  0.65
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(camVideo, {
+      onFrame: async () => { await hands.send({ image: camVideo }); },
+      width:  1280,
+      height: 720
+    });
+    camera.start();
+  </script>
+</body>
+</html>
